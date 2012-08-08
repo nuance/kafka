@@ -12,7 +12,8 @@ A simple, go-like Go Kafka consumer. Use it like follows:
    	)
 
    	func main() {
-   		r, _ := kafka.Open("localhost:1234", "topic", 0, kafka.DefaultReaderOptions())
+   		r, _ := kafka.OpenConsumer("localhost:1234", "topic", 0,
+        kafka.OFF_NEWEST, kafka.DefaultReaderOptions())
 
    		buf := make([]byte, 1024)
    		for _, err := r.Read(buf); err == nil; _, err = r.Read(buf) {
@@ -20,18 +21,18 @@ A simple, go-like Go Kafka consumer. Use it like follows:
 	   	}	
     }
 
-The kafka module exposes a very simple reader interface:
+The kafka module exposes an io.ReadCloser-compatible interface:
 
-    type Reader interface {
-    	Seek(offset uint64)
+    type Consumer interface {
+    	Seek(offset int64)
     	Read(buf []byte) (int, error)
-    	GetOffset() uint64
+    	GetOffset() int64
     	Close() error
 
-    	Offsets(base uint64, num uint32) ([]uint64, error)
+    	Offsets(base int64, num int32) ([]int64, error)
     }
 
-Read will read exactly one message or fail.
+Read will always read exactly one message or fail. Message fetches, however, are batched behind the scene, so calls to Read do not correspond 1:1 with network requests.
 
 ## Warning
 

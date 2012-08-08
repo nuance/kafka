@@ -12,9 +12,9 @@ func TestMessageRead(t *testing.T) {
 		0x74, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67, // "testing"
 	}
 
-	options := DefaultReaderOptions()
+	options := DefaultConsumerOptions()
 	options.ReadBuffer = bytes.NewBuffer(msg)
-	r := Reader{ro: options}
+	r := Consumer{co: options}
 
 	result := make([]byte, 7)
 	if _, err := r.Read(result); err != nil {
