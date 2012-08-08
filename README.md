@@ -12,7 +12,7 @@ A simple, go-like Go Kafka consumer. Use it like follows:
    	)
 
    	func main() {
-   		r, _ := kafka.Open("localhost:1234", "topic", 0)
+   		r, _ := kafka.Open("localhost:1234", "topic", 0, kafka.DefaultReaderOptions())
 
    		buf := make([]byte, 1024)
    		for _, err := r.Read(buf); err == nil; _, err = r.Read(buf) {

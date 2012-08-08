@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
+	"time"
 )
 
 var ErrCrcMismatch = errors.New("CRC-Mismatch")
 
-type reqType uint16
+type reqType int16
 
 const (
 	REQ_PRODUCE reqType = iota
@@ -21,19 +23,19 @@ const (
 	REQ_OFFSETS
 )
 
-var OFF_OLDEST uint64 = (1<<64 - 3) // uint64(max) - 2
-var OFF_NEWEST uint64 = (1<<64 - 2) // uint64(max) - 1
+var OFF_OLDEST int64 = -2
+var OFF_NEWEST int64 = -1
 
 type reqHeader struct {
-	Length   uint32
-	Request  uint16
-	TopicLen uint16
+	Length   int32
+	Request  int16
+	TopicLen int16
 }
 
 type reqFooter struct {
-	Partition uint32
-	Offset    uint64
-	Size      uint32
+	Partition int32
+	Offset    int64
+	Size      int32
 }
 
 type request struct {
@@ -42,11 +44,11 @@ type request struct {
 	topic []byte
 }
 
-func makeRequest(rType reqType, topic string, partition uint32, offset uint64, num uint32) request {
+func makeRequest(rType reqType, topic string, partition int32, offset int64, num int32) request {
 	req := request{}
-	req.Length = uint32(24 + len(topic))
-	req.Request = uint16(rType)
-	req.TopicLen = uint16(len(topic))
+	req.Length = int32(20 + len(topic))
+	req.Request = int16(rType)
+	req.TopicLen = int16(len(topic))
 	req.topic = []byte(topic)
 	req.Partition = partition
 	req.Offset = offset
@@ -68,22 +70,36 @@ func (r request) Write(w io.Writer) error {
 }
 
 type message struct {
-	Length uint32
+	Length int32
 	Magic  byte
-	Crc    uint32
+	Crc    int32
+}
+
+type response struct {
+	Length    int32
+	ErrorCode int16
+}
+
+type ReaderOptions struct {
+	ReadBuffer *bytes.Buffer
+	RetryDelay time.Duration
+}
+
+func DefaultReaderOptions() ReaderOptions {
+	return ReaderOptions{bytes.NewBuffer(make([]byte, 1024*1024)), 100 * time.Millisecond}
 }
 
 type Reader struct {
 	conn net.Conn
-	r    *bytes.Buffer
+	ro   ReaderOptions
 
 	topic     string
-	partition uint32
-	offset    uint64
+	partition int32
+	offset    int64
 }
 
-func Open(addr, topic string, partition uint32) (*Reader, error) {
-	r, err := OpenWithOffset(addr, topic, partition, 0)
+func Open(addr, topic string, partition int32, options ReaderOptions) (*Reader, error) {
+	r, err := OpenWithOffset(addr, topic, partition, 0, options)
 	if err != nil {
 		r.Close()
 		return nil, err
@@ -99,13 +115,13 @@ func Open(addr, topic string, partition uint32) (*Reader, error) {
 	return r, nil
 }
 
-func OpenWithOffset(addr, topic string, partition uint32, offset uint64) (*Reader, error) {
-	conn, err := net.Dial("tcp", addr)
+func OpenWithOffset(addr, topic string, partition int32, offset int64, options ReaderOptions) (*Reader, error) {
+	conn, err := net.DialTimeout("tcp", addr, time.Second*2)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Reader{conn: conn, topic: topic, partition: partition, offset: offset}, nil
+	return &Reader{conn: conn, topic: topic, partition: partition, offset: offset, ro: options}, nil
 }
 
 func (r *Reader) Close() error {
@@ -120,31 +136,40 @@ func (r *Reader) fill() error {
 		return err
 	}
 
-	length := uint32(0)
-	if err := binary.Read(r.conn, binary.BigEndian, &length); err != nil {
+	resp := response{}
+	if err := binary.Read(r.conn, binary.BigEndian, &resp); err != nil {
 		return err
+	} else if resp.ErrorCode != 0 {
+		r.ro.ReadBuffer.Reset()
+		return errors.New(fmt.Sprintf("Kafka error: %d", resp.ErrorCode))
 	}
 
-	r.r.Reset()
-	_, err := io.CopyN(r.r, r.conn, int64(length))
+	r.ro.ReadBuffer.Reset()
+	_, err := io.CopyN(r.ro.ReadBuffer, r.conn, int64(resp.Length-2))
 
 	return err
 }
 
-func (r *Reader) Seek(offset uint64) {
+func (r *Reader) Seek(offset int64) {
 	r.offset = offset
-	r.r.Reset()
+	r.ro.ReadBuffer.Reset()
 }
 
 func (r *Reader) Read(buf []byte) (int, error) {
-	if r.r.Len() == 0 {
+	for r.ro.ReadBuffer.Len() == 0 {
 		if err := r.fill(); err != nil {
 			return 0, err
 		}
+
+		if r.ro.ReadBuffer.Len() > 0 {
+			break
+		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	msg := message{}
-	if err := binary.Read(r.r, binary.BigEndian, &msg); err != nil {
+	if err := binary.Read(r.ro.ReadBuffer, binary.BigEndian, &msg); err != nil {
 		return 0, err
 	}
 
@@ -152,47 +177,49 @@ func (r *Reader) Read(buf []byte) (int, error) {
 		return 9, io.ErrShortBuffer
 	}
 
-	n, err := r.r.Read(buf[:msg.Length-5])
+	n, err := r.ro.ReadBuffer.Read(buf[:msg.Length-5])
 	if err != nil {
 		return 9 + n, err
 	}
 
-	if crc32.ChecksumIEEE(buf[:msg.Length-5]) != msg.Crc {
+	if crc32.ChecksumIEEE(buf[:msg.Length-5]) != uint32(msg.Crc) {
 		return 9 + n, ErrCrcMismatch
 	}
 
-	r.offset += 4 + uint64(msg.Length)
+	r.offset += 4 + int64(msg.Length)
 	return 9 + n, nil
 }
 
-func (r Reader) GetOffset() uint64 {
+func (r Reader) GetOffset() int64 {
 	return r.offset
 }
 
-func (r *Reader) Offsets(base uint64, num uint32) ([]uint64, error) {
+func (r *Reader) Offsets(base int64, num int32) ([]int64, error) {
 	req := makeRequest(REQ_OFFSETS, r.topic, r.partition, base, num)
 	if err := req.Write(r.conn); err != nil {
 		return nil, err
 	}
 
-	length := uint32(0)
-	if err := binary.Read(r.conn, binary.BigEndian, &length); err != nil {
+	resp := response{}
+	if err := binary.Read(r.conn, binary.BigEndian, &resp); err != nil {
 		return nil, err
+	} else if resp.ErrorCode != 0 {
+		return nil, errors.New(fmt.Sprintf("Kafka error: %d", resp.ErrorCode))
 	}
 
 	buf := new(bytes.Buffer)
-	if _, err := io.CopyN(buf, r.conn, int64(length)); err != nil {
+	if _, err := io.CopyN(buf, r.conn, int64(resp.Length-2)); err != nil {
 		return nil, err
 	}
 
-	numOffsets := uint32(0)
+	numOffsets := int32(0)
 	if err := binary.Read(buf, binary.BigEndian, &numOffsets); err != nil {
 		return nil, err
 	}
 
-	offsets := make([]uint64, numOffsets)
-	for i := uint32(0); i < numOffsets; i++ {
-		offset := uint64(0)
+	offsets := make([]int64, numOffsets)
+	for i := int32(0); i < numOffsets; i++ {
+		offset := int64(0)
 		if err := binary.Read(buf, binary.BigEndian, &offset); err != nil {
 			return nil, err
 		}
